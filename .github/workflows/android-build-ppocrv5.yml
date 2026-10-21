@@ -2,7 +2,7 @@ name: Android Build - PaddleOCR PP-OCRv5
 
 on:
   push:
-    branches: ["main", "master"]
+    branches: ["main", "master", "paddleocr-ppocrv5-integration"]
   pull_request:
     branches: ["main", "master"]
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Prepare OCR SDK and build debug APK
+    name: Download PP-OCRv5 models and build APK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -32,11 +32,81 @@ jobs:
       - name: Install Android platform and build tools
         run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Download official PaddleOCR Android SDK source
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/PaddlePaddle/PaddleOCR.git /tmp/PaddleOCR
+          git -C /tmp/PaddleOCR sparse-checkout set deploy/ppocr-android/ppocr-sdk
+          mkdir -p ppocr-sdk
+          cp -R /tmp/PaddleOCR/deploy/ppocr-android/ppocr-sdk/src ppocr-sdk/
+          cp /tmp/PaddleOCR/deploy/ppocr-android/ppocr-sdk/src/main/AndroidManifest.xml ppocr-sdk/src/main/AndroidManifest.xml
+          cat > ppocr-sdk/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.library")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.paddle.ocr"
+              compileSdk = 35
+              defaultConfig { minSdk = 26 }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("com.microsoft.onnxruntime:onnxruntime-android:1.21.1")
+              implementation("com.quickbirdstudios:opencv:4.5.3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+              implementation("androidx.core:core-ktx:1.15.0")
+          }
+          EOF
 
-      - name: Prepare PaddleOCR SDK and PP-OCRv5 model assets
-        run: bash ./scripts/prepare-paddleocr.sh .
+      - name: Download and install PP-OCRv5 Mobile ONNX models
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ppocr-models ppocr-sdk/src/main/assets/models/det ppocr-sdk/src/main/assets/models/rec
+          curl --retry 3 --retry-delay 2 -fL \
+            "https://huggingface.co/LunarOilRig/paddleocr-onnx/resolve/main/PP-OCRv5_mobile_det_onnx_infer.tar" \
+            -o /tmp/ppocr-models/det.tar
+          curl --retry 3 --retry-delay 2 -fL \
+            "https://huggingface.co/LunarOilRig/paddleocr-onnx/resolve/main/PP-OCRv5_mobile_rec_onnx_infer.tar" \
+            -o /tmp/ppocr-models/rec.tar
+          mkdir -p /tmp/ppocr-models/det /tmp/ppocr-models/rec
+          tar -xf /tmp/ppocr-models/det.tar -C /tmp/ppocr-models/det
+          tar -xf /tmp/ppocr-models/rec.tar -C /tmp/ppocr-models/rec
+          DET=$(find /tmp/ppocr-models/det -type f -name inference.onnx | head -n 1)
+          REC=$(find /tmp/ppocr-models/rec -type f -name inference.onnx | head -n 1)
+          YAML=$(find /tmp/ppocr-models/rec -type f -name inference.yml | head -n 1)
+          test -n "$DET" && test -n "$REC" && test -n "$YAML"
+          cp "$DET" ppocr-sdk/src/main/assets/models/det/inference.onnx
+          cp "$REC" ppocr-sdk/src/main/assets/models/rec/inference.onnx
+          cp "$YAML" ppocr-sdk/src/main/assets/models/rec/inference.yml
+          echo "Detection model: $(du -h ppocr-sdk/src/main/assets/models/det/inference.onnx)"
+          echo "Recognition model: $(du -h ppocr-sdk/src/main/assets/models/rec/inference.onnx)"
+          test -s ppocr-sdk/src/main/assets/models/det/inference.onnx
+          test -s ppocr-sdk/src/main/assets/models/rec/inference.onnx
+
+      - name: Configure project for PaddleOCR SDK
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("settings.gradle.kts")
+          s = p.read_text()
+          if 'include(":ppocr-sdk")' not in s:
+              s += '\ninclude(":ppocr-sdk")\n'
+          p.write_text(s)
+          p = Path("build.gradle.kts")
+          s = p.read_text().replace('id("org.jetbrains.kotlin.android") version "2.0.21" apply false',
+                                    'id("org.jetbrains.kotlin.android") version "2.1.0" apply false')
+          p.write_text(s)
+          p = Path("app/build.gradle.kts")
+          s = p.read_text()
+          s = s.replace('    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")\n','')
+          if 'implementation(project(":ppocr-sdk"))' not in s:
+              s = s.replace('dependencies {', 'dependencies {\n    implementation(project(":ppocr-sdk"))\n    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")')
+          p.write_text(s)
+          PY
 
       - name: Build debug APK
         run: gradle --no-daemon assembleDebug
