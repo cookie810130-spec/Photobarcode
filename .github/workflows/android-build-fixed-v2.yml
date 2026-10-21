@@ -2,9 +2,9 @@ name: Android Build
 
 on:
   push:
-    branches: ["mai", "master"]
+    branches: ["main", "master"]
   pull_request:
-    branches: ["mai", "master"]
+    branches: ["main", "master"]
   workflow_dispatch:
 
 permissions:
