@@ -42,7 +42,6 @@ class MainActivity : AppCompatActivity() {
     private data class KeyStroke(val modifiers: Int, val keyCode: Int)
 
     private lateinit var status: TextView
-    private lateinit var fullTextButton: Button
     private lateinit var manualInput: EditText
 
     private var pendingCameraUri: Uri? = null
@@ -226,9 +225,10 @@ class MainActivity : AppCompatActivity() {
         content.addView(keyRow)
 
         content.addView(button("傳送到電腦") {
+            val manual = manualInput.text.toString()
             val selected = selectedText(ocrTextView)
-            val value = if (selected.isNotBlank()) selected else manualInput.text.toString()
-            sendTextToComputer(value, clearInputOnSuccess = true)
+            val value = if (manual.isNotBlank()) manual else selected
+            sendTextToComputer(value, clearInputOnSuccess = true, clearOcrSelection = manual.isBlank() && selected.isNotBlank())
         }.apply { textSize = 18f }, LinearLayout.LayoutParams(-1, dp(56)).apply {
             topMargin = dp(6)
         })
@@ -264,7 +264,6 @@ class MainActivity : AppCompatActivity() {
         if (isRecognizing) return
         isRecognizing = true
         status.text = "正在載入 PP-OCRv5 並辨識照片……"
-        fullTextButton.isEnabled = false
 
         lifecycleScope.launch {
             var bitmap: Bitmap? = null
@@ -304,7 +303,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 latestOcrText = resultText.lines().map { it.substringBefore("\t[") }
                     .filter { it.isNotBlank() }.joinToString("\n")
-                fullTextButton.isEnabled = latestOcrText.isNotBlank()
                 ocrTextView.text = latestOcrText
                 status.text = "PP-OCRv5 辨識完成，共 " + latestOcrText.lines().count { it.isNotBlank() } + " 行文字。請選取要輸入電腦的文字。"
             } catch (e: Throwable) {
@@ -630,7 +628,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sendTextToComputer(text: String, clearInputOnSuccess: Boolean = false) {
+    private fun sendTextToComputer(text: String, clearInputOnSuccess: Boolean = false, clearOcrSelection: Boolean = false) {
         val value = text.trim()
         if (value.isEmpty()) {
             status.text = "請先選取 OCR 英數文字或在輸入框輸入內容。"
@@ -658,6 +656,7 @@ class MainActivity : AppCompatActivity() {
                     delay(12)
                 }
                 if (clearInputOnSuccess) manualInput.setText("")
+                if (clearOcrSelection) ocrTextView.text = latestOcrText
                 status.text = "已傳送 " + value.length + " 個字元。"
             } catch (e: Exception) {
                 status.text = "傳送失敗：" + (e.localizedMessage ?: "請確認電腦仍保持連線。")
