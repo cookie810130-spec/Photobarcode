@@ -135,10 +135,12 @@ class MainActivity : AppCompatActivity() {
         buildUi()
     }
 
+    private lateinit var ocrTextView: TextView
+
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             setBackgroundColor(Color.rgb(244, 248, 252))
         }
         val scroll = ScrollView(this)
@@ -147,72 +149,94 @@ class MainActivity : AppCompatActivity() {
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
         content.addView(TextView(this).apply {
-            text = "OCR 藍牙鍵盤"
-            textSize = 24f
+            text = "手機照片條碼輸入器"
+            textSize = 23f
             setTextColor(Color.rgb(24, 54, 84))
             typeface = Typeface.DEFAULT_BOLD
         })
         content.addView(TextView(this).apply {
-            text = "辨識照片後選取文字，透過藍牙鍵盤直接輸入電腦目前選取的欄位。支援英數字與常見符號。"
+            text = "先連線電腦，再拍照或選照片。長按 OCR 文字選取英數內容，或在下方手動輸入。"
             textSize = 14f
             setTextColor(Color.DKGRAY)
-            setPadding(0, dp(6), 0, dp(12))
+            setPadding(0, dp(5), 0, dp(8))
         })
 
         val bluetoothRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         bluetoothRow.addView(button("配對電腦") { prepareKeyboard(pairing = true) },
-            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(5) })
+            LinearLayout.LayoutParams(0, dp(46), 1f).apply { marginEnd = dp(5) })
         bluetoothRow.addView(button("連線電腦") { prepareKeyboard(pairing = false) },
-            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(5) })
+            LinearLayout.LayoutParams(0, dp(46), 1f).apply { marginStart = dp(5) })
         content.addView(bluetoothRow)
 
         val photoRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         photoRow.addView(button("拍照") { launchCamera() },
-            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(5) })
+            LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(5) })
         photoRow.addView(button("選照片") { pickImage.launch("image/*") },
-            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(5) })
+            LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginStart = dp(5) })
         content.addView(photoRow)
 
         status = TextView(this).apply {
-            text = "先配對並連線電腦，再拍照或選取處方照片。首次辨識需要載入 OCR 模型。"
+            text = "尚未連線。請先配對並連線電腦。"
             textSize = 14f
             setTextColor(Color.rgb(70, 85, 100))
-            setPadding(0, dp(12), 0, dp(8))
+            setPadding(0, dp(8), 0, dp(6))
         }
         content.addView(status)
 
-        fullTextButton = button("查看並選取 OCR 文字") { showFullOcrText() }
-        fullTextButton.isEnabled = false
-        content.addView(fullTextButton)
-
         content.addView(TextView(this).apply {
-            text = "手動輸入"
-            textSize = 17f
+            text = "OCR 全文（長按選取）"
+            textSize = 18f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.rgb(24, 54, 84))
-            setPadding(0, dp(16), 0, dp(6))
+            setPadding(0, dp(5), 0, dp(5))
         })
-        manualInput = EditText(this).apply {
-            hint = "輸入要傳送到電腦的文字"
-            setSingleLine(true)
+        ocrTextView = TextView(this).apply {
+            text = "拍照或選擇照片後，OCR 文字會顯示在這裡。"
             textSize = 16f
+            setTextColor(Color.rgb(30, 45, 60))
+            setTextIsSelectable(true)
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setBackgroundColor(Color.WHITE)
         }
-        content.addView(manualInput)
-        content.addView(button("發送到電腦") {
-            sendTextToComputer(manualInput.text.toString())
-        })
+        val ocrScroll = ScrollView(this).apply { addView(ocrTextView) }
+        content.addView(ocrScroll, LinearLayout.LayoutParams(-1, dp(250)))
 
         content.addView(TextView(this).apply {
-            text = "使用方式：先在電腦開啟目標欄位並完成配對，再從 OCR 全文框選內容並按「發送選取文字」。"
-            textSize = 13f
-            setTextColor(Color.rgb(70, 85, 100))
-            setPadding(0, dp(14), 0, dp(4))
+            text = "手動輸入／選取文字"
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(24, 54, 84))
+            setPadding(0, dp(9), 0, dp(4))
+        })
+        manualInput = EditText(this).apply {
+            hint = "點擊輸入文字，開啟 Android 原生鍵盤"
+            setSingleLine(true)
+            textSize = 18f
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+        }
+        content.addView(manualInput, LinearLayout.LayoutParams(-1, dp(52)))
+
+        val keyRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        keyRow.addView(button("Tab\n下一欄") { sendControlKey(0x2B, "Tab") },
+            LinearLayout.LayoutParams(0, dp(60), 1f).apply { marginEnd = dp(4) })
+        keyRow.addView(button("Enter\n確認") { sendControlKey(0x28, "Enter") },
+            LinearLayout.LayoutParams(0, dp(60), 1f).apply { marginHorizontal = dp(4) })
+        keyRow.addView(button("Backspace\n刪除一字") { sendControlKey(0x2A, "Backspace") },
+            LinearLayout.LayoutParams(0, dp(60), 1f).apply { marginStart = dp(4) })
+        content.addView(keyRow)
+
+        content.addView(button("傳送到電腦") {
+            val selected = selectedText(ocrTextView)
+            val value = if (selected.isNotBlank()) selected else manualInput.text.toString()
+            sendTextToComputer(value, clearInputOnSuccess = true)
+        }.apply { textSize = 18f }, LinearLayout.LayoutParams(-1, dp(56)).apply {
+            topMargin = dp(6)
         })
         content.addView(TextView(this).apply {
-            text = "隱私提醒：只有按下發送後，選取文字才會以藍牙鍵盤輸入到電腦。OCR 及輸入內容仍請人工核對。"
+            text = "傳送成功後會清空輸入框；不會自動按 Enter 或 Tab。"
             textSize = 12f
-            setTextColor(Color.rgb(160, 65, 35))
-            setPadding(0, dp(8), 0, 0)
+            setTextColor(Color.rgb(130, 70, 35))
+            setPadding(0, dp(6), 0, dp(3))
         })
         setContentView(root)
     }
@@ -281,6 +305,7 @@ class MainActivity : AppCompatActivity() {
                 latestOcrText = resultText.lines().map { it.substringBefore("\t[") }
                     .filter { it.isNotBlank() }.joinToString("\n")
                 fullTextButton.isEnabled = latestOcrText.isNotBlank()
+                ocrTextView.text = latestOcrText
                 status.text = "PP-OCRv5 辨識完成，共 " + latestOcrText.lines().count { it.isNotBlank() } + " 行文字。請選取要輸入電腦的文字。"
             } catch (e: Throwable) {
                 status.text = "PaddleOCR 辨識失敗：${e.localizedMessage ?: e.javaClass.simpleName}。請確認 OpenCV 原生程式庫、SDK 與 PP-OCRv5 模型已整合。"
@@ -584,15 +609,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sendTextToComputer(text: String) {
+    private fun sendControlKey(keyCode: Int, label: String) {
+        val host = connectedHost
+        val keyboard = hidDevice
+        if (!hidRegistered || keyboard == null || host == null) {
+            status.text = "尚未連線電腦，無法傳送 $label。"
+            return
+        }
+        lifecycleScope.launch {
+            try {
+                check(keyboard.sendReport(host, 0, byteArrayOf(0, 0, keyCode.toByte(), 0, 0, 0, 0, 0))) {
+                    "$label 傳送失敗"
+                }
+                delay(20)
+                check(keyboard.sendReport(host, 0, ByteArray(8))) { "$label 按鍵釋放失敗" }
+                status.text = "已傳送 $label。"
+            } catch (e: Exception) {
+                status.text = "$label 傳送失敗：" + (e.localizedMessage ?: "請確認電腦仍保持連線。")
+            }
+        }
+    }
+
+    private fun sendTextToComputer(text: String, clearInputOnSuccess: Boolean = false) {
         val value = text.trim()
         if (value.isEmpty()) {
-            status.text = "請先選取或輸入要發送的文字。"
+            status.text = "請先選取 OCR 英數文字或在輸入框輸入內容。"
             return
         }
         val strokes = value.map { keyStrokeFor(it) }
         if (strokes.any { it == null }) {
-            status.text = "文字含有藍牙鍵盤不支援的字元；目前支援英文字母、數字、空格及常見符號。"
+            status.text = "文字含有不支援的字元；請使用英文字母、數字、空格及常見符號。"
             return
         }
         val host = connectedHost
@@ -605,14 +651,13 @@ class MainActivity : AppCompatActivity() {
             status.text = "正在輸入到 " + (host.name ?: "電腦") + "……"
             try {
                 strokes.filterNotNull().forEach { stroke ->
-                    val pressed = byteArrayOf(
-                        stroke.modifiers.toByte(), 0, stroke.keyCode.toByte(), 0, 0, 0, 0, 0
-                    )
+                    val pressed = byteArrayOf(stroke.modifiers.toByte(), 0, stroke.keyCode.toByte(), 0, 0, 0, 0, 0)
                     check(keyboard.sendReport(host, 0, pressed)) { "藍牙鍵盤傳送失敗" }
                     delay(12)
                     check(keyboard.sendReport(host, 0, ByteArray(8))) { "藍牙鍵盤釋放按鍵失敗" }
                     delay(12)
                 }
+                if (clearInputOnSuccess) manualInput.setText("")
                 status.text = "已傳送 " + value.length + " 個字元。"
             } catch (e: Exception) {
                 status.text = "傳送失敗：" + (e.localizedMessage ?: "請確認電腦仍保持連線。")
