@@ -12,7 +12,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = 1
-        versionName = "0.2.0-ppocrv5"
+        versionName = "0.3.0-bluetooth-keyboard"
     }
 
     compileOptions {
@@ -31,7 +31,6 @@ dependencies {
     // QuickBird recommends 4.5.3.0 rather than 4.5.3 for Android runtime reliability.
     implementation("com.quickbirdstudios:opencv:4.5.3.0")
 
-    implementation("com.google.zxing:core:3.5.3")
     implementation("androidx.activity:activity-ktx:1.10.0")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
