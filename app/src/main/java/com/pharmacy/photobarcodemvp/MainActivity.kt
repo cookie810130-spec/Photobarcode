@@ -220,7 +220,7 @@ class MainActivity : AppCompatActivity() {
         keyRow.addView(button("Tab\n下一欄") { sendControlKey(0x2B, "Tab") },
             LinearLayout.LayoutParams(0, dp(60), 1f).apply { marginEnd = dp(4) })
         keyRow.addView(button("Enter\n確認") { sendControlKey(0x28, "Enter") },
-            LinearLayout.LayoutParams(0, dp(60), 1f).apply { marginHorizontal = dp(4) })
+            LinearLayout.LayoutParams(0, dp(60), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
         keyRow.addView(button("Backspace\n刪除一字") { sendControlKey(0x2A, "Backspace") },
             LinearLayout.LayoutParams(0, dp(60), 1f).apply { marginStart = dp(4) })
         content.addView(keyRow)
