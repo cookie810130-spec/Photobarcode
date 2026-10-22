@@ -1,28 +1,36 @@
 package com.pharmacy.photobarcodemvp
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHidDevice
+import android.bluetooth.BluetoothHidDeviceAppSdpSettings
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
 import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
-import android.view.Gravity
-import android.view.View
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.paddle.ocr.PaddleOCR
 import com.paddle.ocr.PaddleOCRConfig
 import com.paddle.ocr.EngineConfig
 import org.opencv.android.OpenCVLoader
-import com.google.zxing.BarcodeFormat
-import com.google.zxing.EncodeHintType
-import com.google.zxing.MultiFormatWriter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.util.Locale
 
@@ -31,22 +39,83 @@ import java.util.Locale
  * OpenCV JNI is initialized before PaddleOCR is used.
  */
 class MainActivity : AppCompatActivity() {
-    private data class Entry(var type: String, var value: String, var confirmed: Boolean = false)
+    private data class KeyStroke(val modifiers: Int, val keyCode: Int)
 
-    private val entries = mutableListOf<Entry>()
-    private lateinit var listContainer: LinearLayout
     private lateinit var status: TextView
-    private lateinit var barcodeImage: ImageView
-    private lateinit var barcodeValue: TextView
-    private lateinit var barcodePanel: LinearLayout
-    private lateinit var counter: TextView
     private lateinit var fullTextButton: Button
+    private lateinit var manualInput: EditText
 
-    private var currentBarcodeIndex = 0
     private var pendingCameraUri: Uri? = null
     private var latestOcrText: String = ""
     private var paddleOcr: PaddleOCR? = null
     private var isRecognizing = false
+
+    private var bluetoothAdapter: BluetoothAdapter? = null
+    private var hidDevice: BluetoothHidDevice? = null
+    private var connectedHost: BluetoothDevice? = null
+    private var hidRegistered = false
+    private var hidRegistrationRequested = false
+    private var pendingPairing = false
+
+    private val bluetoothPermissionRequest =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+            if (results.values.all { it }) startHidRegistration(pendingPairing)
+            else status.text = "需要附近裝置權限才能使用藍牙鍵盤。"
+        }
+
+    private val enableBluetoothRequest =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == RESULT_OK) startHidRegistration(pendingPairing)
+            else status.text = "藍牙未啟用，無法連線電腦。"
+        }
+
+    private val discoverableRequest =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            status.text = if (result.resultCode == RESULT_OK) {
+                "手機目前可被電腦搜尋。請在電腦的藍牙設定中新增「PhotoBarcode Keyboard」，配對後按「連線電腦」。"
+            } else "已取消配對。"
+        }
+
+    private val hidProfileListener = object : BluetoothProfile.ServiceListener {
+        override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+            if (profile != BluetoothProfile.HID_DEVICE) return
+            hidDevice = proxy as BluetoothHidDevice
+            registerHidKeyboard()
+        }
+
+        override fun onServiceDisconnected(profile: Int) {
+            if (profile == BluetoothProfile.HID_DEVICE) {
+                hidDevice = null
+                connectedHost = null
+                hidRegistered = false
+                status.text = "藍牙鍵盤連線中斷。"
+            }
+        }
+    }
+
+    private val hidCallback = object : BluetoothHidDevice.Callback() {
+        override fun onAppStatusChanged(device: BluetoothDevice?, registered: Boolean) {
+            hidRegistered = registered
+            hidRegistrationRequested = false
+            if (!registered) {
+                status.text = "藍牙鍵盤尚未註冊。"
+                return
+            }
+            status.text = "藍牙鍵盤已就緒。請配對或連線電腦。"
+            if (pendingPairing) makePhoneDiscoverable()
+            else refreshConnectedHost()
+        }
+
+        override fun onConnectionStateChanged(device: BluetoothDevice, state: Int) {
+            if (state == BluetoothProfile.STATE_CONNECTED) {
+                connectedHost = device
+                status.text = "已連線到 " + (device.name ?: "電腦") + "。請在電腦選好輸入欄位後發送。"
+            } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
+                if (connectedHost?.address == device.address) connectedHost = null
+                status.text = "電腦已中斷連線。"
+            }
+        }
+    }
 
     private val takePicture =
         registerForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
@@ -64,7 +133,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
-        renderEntries()
     }
 
     private fun buildUi() {
@@ -79,133 +147,69 @@ class MainActivity : AppCompatActivity() {
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
         content.addView(TextView(this).apply {
-            text = "手機照片條碼輸入器"
+            text = "OCR 藍牙鍵盤"
             textSize = 24f
             setTextColor(Color.rgb(24, 54, 84))
             typeface = Typeface.DEFAULT_BOLD
         })
         content.addView(TextView(this).apply {
-            text = "先辨識全文，再整頁選取文字加入清單；依機構代碼、身分證字號、健保碼分組。"
+            text = "辨識照片後選取文字，透過藍牙鍵盤直接輸入電腦目前選取的欄位。支援英數字與常見符號。"
             textSize = 14f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(6), 0, dp(12))
         })
 
+        val bluetoothRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        bluetoothRow.addView(button("配對電腦") { prepareKeyboard(pairing = true) },
+            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(5) })
+        bluetoothRow.addView(button("連線電腦") { prepareKeyboard(pairing = false) },
+            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(5) })
+        content.addView(bluetoothRow)
+
         val photoRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         photoRow.addView(button("拍照") { launchCamera() },
-            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(6) })
+            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(5) })
         photoRow.addView(button("選照片") { pickImage.launch("image/*") },
-            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(6) })
+            LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(5) })
         content.addView(photoRow)
 
         status = TextView(this).apply {
-            text = "請拍攝處方箋或從相簿選取照片。首次辨識需要載入 OCR 模型。"
+            text = "先配對並連線電腦，再拍照或選取處方照片。首次辨識需要載入 OCR 模型。"
             textSize = 14f
             setTextColor(Color.rgb(70, 85, 100))
             setPadding(0, dp(12), 0, dp(8))
         }
         content.addView(status)
 
-        fullTextButton = button("查看完整 OCR 文字") { showFullOcrText() }
+        fullTextButton = button("查看並選取 OCR 文字") { showFullOcrText() }
         fullTextButton.isEnabled = false
         content.addView(fullTextButton)
 
         content.addView(TextView(this).apply {
-            text = "條碼清單（機構代碼 → 身分證字號 → 健保碼；類別內依加入順序）"
-            textSize = 17f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.rgb(24, 54, 84))
-            setPadding(0, dp(12), 0, dp(8))
-        })
-        listContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        content.addView(listContainer)
-
-        content.addView(TextView(this).apply {
-            text = "手動新增"
+            text = "手動輸入"
             textSize = 17f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.rgb(24, 54, 84))
             setPadding(0, dp(16), 0, dp(6))
         })
-        val typeSpinner = Spinner(this)
-        typeSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
-            listOf("機構代碼", "身分證字號", "健保碼", "其他文字"))
-        content.addView(typeSpinner)
-        val manualInput = EditText(this).apply {
-            hint = "輸入或修正文字"
+        manualInput = EditText(this).apply {
+            hint = "輸入要傳送到電腦的文字"
             setSingleLine(true)
             textSize = 16f
         }
         content.addView(manualInput)
-        content.addView(button("新增到條碼清單") {
-            val value = manualInput.text.toString().trim()
-            if (value.isBlank()) status.text = "請先輸入文字"
-            else {
-                insertEntryGrouped(Entry(typeSpinner.selectedItem.toString(), value, true))
-                manualInput.text.clear()
-                renderEntries()
-                status.text = "已新增，請確認順序"
-            }
+        content.addView(button("發送到電腦") {
+            sendTextToComputer(manualInput.text.toString())
         })
-        content.addView(button("開始條碼輸出") {
-            if (entries.isEmpty()) status.text = "目前沒有資料，請先辨識或手動新增"
-            else {
-                currentBarcodeIndex = 0
-                renderBarcode()
-            }
-        }.apply { setPadding(0, dp(8), 0, dp(8)) })
 
-        barcodePanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dp(8), dp(12), dp(8), dp(12))
-            setBackgroundColor(Color.WHITE)
-            visibility = View.GONE
-        }
-        counter = TextView(this).apply {
-            textSize = 14f
-            setTextColor(Color.DKGRAY)
-            gravity = Gravity.CENTER
-        }
-        barcodeValue = TextView(this).apply {
-            textSize = 18f
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            setTextColor(Color.BLACK)
-            setPadding(0, dp(8), 0, dp(8))
-        }
-        barcodeImage = ImageView(this).apply {
-            adjustViewBounds = true
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            contentDescription = "Code 128 條碼"
-        }
-        barcodePanel.addView(counter)
-        barcodePanel.addView(barcodeImage, LinearLayout.LayoutParams(-1, dp(180)))
-        barcodePanel.addView(barcodeValue)
-        barcodePanel.addView(TextView(this).apply {
-            text = "請讓掃描器只讀取畫面中央的這一個條碼。掃描完成後再按下一筆。"
-            textSize = 12f
-            gravity = Gravity.CENTER
-            setTextColor(Color.DKGRAY)
+        content.addView(TextView(this).apply {
+            text = "使用方式：先在電腦開啟目標欄位並完成配對，再從 OCR 全文框選內容並按「發送選取文字」。"
+            textSize = 13f
+            setTextColor(Color.rgb(70, 85, 100))
+            setPadding(0, dp(14), 0, dp(4))
         })
-        val nav = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        nav.addView(button("上一筆") {
-            if (currentBarcodeIndex > 0) {
-                currentBarcodeIndex--
-                renderBarcode()
-            }
-        }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(4) })
-        nav.addView(button("下一筆") {
-            if (currentBarcodeIndex < entries.lastIndex) {
-                currentBarcodeIndex++
-                renderBarcode()
-            } else status.text = "已到最後一筆"
-        }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(4) })
-        barcodePanel.addView(nav)
-        content.addView(barcodePanel)
-
-        root.addView(TextView(this).apply {
-            text = "注意：OCR 結果及格式符合都不代表資料正確；掃描前請人工核對。"
+        content.addView(TextView(this).apply {
+            text = "隱私提醒：只有按下發送後，選取文字才會以藍牙鍵盤輸入到電腦。OCR 及輸入內容仍請人工核對。"
             textSize = 12f
             setTextColor(Color.rgb(160, 65, 35))
             setPadding(0, dp(8), 0, 0)
@@ -277,9 +281,7 @@ class MainActivity : AppCompatActivity() {
                 latestOcrText = resultText.lines().map { it.substringBefore("\t[") }
                     .filter { it.isNotBlank() }.joinToString("\n")
                 fullTextButton.isEnabled = latestOcrText.isNotBlank()
-                // Deliberately do not auto-add guessed candidates: let the operator select exact text.
-                status.text = "PP-OCRv5 辨識完成，共 ${latestOcrText.lines().count { it.isNotBlank() }} 行文字。請開啟整頁文字，依序選取並加入代碼。"
-                renderEntries()
+                status.text = "PP-OCRv5 辨識完成，共 " + latestOcrText.lines().count { it.isNotBlank() } + " 行文字。請選取要輸入電腦的文字。"
             } catch (e: Throwable) {
                 status.text = "PaddleOCR 辨識失敗：${e.localizedMessage ?: e.javaClass.simpleName}。請確認 OpenCV 原生程式庫、SDK 與 PP-OCRv5 模型已整合。"
             } finally {
@@ -287,44 +289,6 @@ class MainActivity : AppCompatActivity() {
                 isRecognizing = false
             }
         }
-    }
-
-    private fun extractCandidates(text: String): List<Entry> {
-        val found = mutableListOf<Entry>()
-        val seen = mutableSetOf<String>()
-        val lines = text.lines()
-        val nhRegex = Regex("(?<![A-Z0-9])[A-Z]{2}\\d{6}(?:\\d{2}|[A-Z]{2}|[A-Z]\\d)(?![A-Z0-9])", RegexOption.IGNORE_CASE)
-        val idRegex = Regex("(?<![A-Z0-9])[A-Z][12]\\d{8}(?!\\d)", RegexOption.IGNORE_CASE)
-        val maskedIdRegex = Regex("(?<![A-Z0-9])[A-Z][12]\\d{5,7}(?:\\*{1,4}|X{1,4})(?![A-Z0-9])", RegexOption.IGNORE_CASE)
-        val facilityRegex = Regex("(?<!\\d)\\d{10}(?!\\d)")
-        val facilityLabelRegex = Regex("醫事機構代碼|醫療院所代碼|醫事機構|醫療院所")
-
-        lines.forEachIndexed { index, rawLine ->
-            val line = rawLine.uppercase(Locale.ROOT).replace(" ", "").replace("：", ":")
-            nhRegex.findAll(line).forEach { addCandidate(found, seen, "健保碼", it.value) }
-            if (line.contains("身分證號") || line.contains("身分證字號") || line.contains("身份證號")) {
-                idRegex.findAll(line).forEach { addCandidate(found, seen, "身分證字號", it.value) }
-                maskedIdRegex.findAll(line).forEach { addCandidate(found, seen, "身分證字號", it.value) }
-            }
-            if (facilityLabelRegex.containsMatchIn(line)) {
-                facilityRegex.findAll(line).forEach { addCandidate(found, seen, "醫事機構代碼", it.value) }
-                if (facilityRegex.findAll(line).none() && index < lines.lastIndex) {
-                    for (nextIndex in (index + 1)..minOf(index + 2, lines.lastIndex)) {
-                        facilityRegex.findAll(lines[nextIndex].replace(" ", "")).forEach {
-                            addCandidate(found, seen, "醫事機構代碼", it.value)
-                        }
-                    }
-                }
-            } else {
-                idRegex.findAll(line).forEach { addCandidate(found, seen, "身分證字號", it.value) }
-            }
-        }
-        return found
-    }
-
-    private fun addCandidate(target: MutableList<Entry>, seen: MutableSet<String>, type: String, value: String) {
-        val clean = value.trim().uppercase(Locale.ROOT)
-        if (clean.isNotBlank() && seen.add("$type|$clean")) target.add(Entry(type, clean, false))
     }
 
     private fun showFullOcrText() {
@@ -338,29 +302,18 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(14), dp(12), dp(14), dp(10))
             setBackgroundColor(Color.rgb(244, 248, 252))
         }
-        val heading = TextView(this).apply {
-            text = "整頁選取 OCR 文字"
+        page.addView(TextView(this).apply {
+            text = "選取要輸入電腦的文字"
             textSize = 21f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.rgb(24, 54, 84))
-        }
-        page.addView(heading)
+        })
         page.addView(TextView(this).apply {
-            text = "長按文字後拖曳選取代碼，再選類型並按「加入清單」。同類型依加入順序排列。"
+            text = "長按 OCR 文字並拖曳選取，再按「發送選取文字」。請先在電腦點選正確欄位。"
             textSize = 13f
             setTextColor(Color.DKGRAY)
             setPadding(0, dp(5), 0, dp(8))
         })
-
-        val typeSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(
-                this@MainActivity,
-                android.R.layout.simple_spinner_dropdown_item,
-                listOf("機構代碼", "身分證字號", "健保碼", "其他文字")
-            )
-            setSelection(0)
-        }
-        page.addView(typeSpinner, LinearLayout.LayoutParams(-1, dp(48)))
 
         val selectedPreview = TextView(this).apply {
             text = "尚未選取文字"
@@ -381,7 +334,6 @@ class MainActivity : AppCompatActivity() {
             setTextIsSelectable(true)
             setPadding(dp(10), dp(10), dp(10), dp(10))
             setBackgroundColor(Color.WHITE)
-            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 17f)
         }
         val textScroll = ScrollView(this).apply {
             isFillViewport = true
@@ -390,58 +342,25 @@ class MainActivity : AppCompatActivity() {
         page.addView(textScroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
         val actionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val refreshSelection = button("讀取選取") {
-            val text = ocrTextView.text
-            val a = ocrTextView.selectionStart
-            val b = ocrTextView.selectionEnd
-            selectedPreview.text = if (a >= 0 && b >= 0 && a != b) {
-                text.subSequence(minOf(a, b), maxOf(a, b)).toString().trim()
-            } else {
+        actionRow.addView(button("讀取選取") {
+            selectedPreview.text = selectedText(ocrTextView).ifBlank {
                 "尚未選取文字：請長按 OCR 文字並拖曳選取"
             }
-        }
-        actionRow.addView(refreshSelection, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
-            marginEnd = dp(4)
-        })
-        val addSelected = button("加入清單") {
-            val text = ocrTextView.text
-            val a = ocrTextView.selectionStart
-            val b = ocrTextView.selectionEnd
-            val selected = if (a >= 0 && b >= 0 && a != b) {
-                text.subSequence(minOf(a, b), maxOf(a, b)).toString().trim()
-            } else ""
+        }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(4) })
+        actionRow.addView(button("發送選取文字") {
+            val selected = selectedText(ocrTextView)
             if (selected.isBlank()) {
                 Toast.makeText(this, "請先長按並選取文字", Toast.LENGTH_SHORT).show()
             } else {
-                val type = typeSpinner.selectedItem.toString()
-                val values = selected.lines().map { it.trim() }.filter { it.isNotBlank() }
-                val existing = entries.map { "${it.type}|${it.value}" }.toMutableSet()
-                var added = 0
-                values.forEach { value ->
-                    val key = "$type|$value"
-                    if (existing.add(key)) {
-                        insertEntryGrouped(Entry(type, value, true))
-                        added++
-                    }
-                }
-                renderEntries()
-                status.text = if (added > 0) "已加入 ${added} 筆；同類型依選取加入順序排列。" else "選取內容已存在，沒有重複新增。"
-                selectedPreview.text = if (added > 0) "已加入：${values.joinToString("、")}" else "這些文字已在清單中"
-                Toast.makeText(this, if (added > 0) "已加入 $added 筆" else "沒有新增（可能重複）", Toast.LENGTH_SHORT).show()
+                selectedPreview.text = "準備發送：" + selected
+                sendTextToComputer(selected)
             }
-        }
-        actionRow.addView(addSelected, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
-            marginStart = dp(4)
-        })
+        }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(4) })
         page.addView(actionRow)
 
         var selectionDialog: android.app.Dialog? = null
-        val closeButton = button("完成，返回清單") {
-            selectionDialog?.dismiss()
-        }
-        page.addView(closeButton, LinearLayout.LayoutParams(-1, dp(46)).apply {
-            topMargin = dp(5)
-        })
+        page.addView(button("完成，返回") { selectionDialog?.dismiss() },
+            LinearLayout.LayoutParams(-1, dp(46)).apply { topMargin = dp(5) })
 
         val dialog = android.app.Dialog(this)
         selectionDialog = dialog
@@ -454,127 +373,21 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    private fun typeRank(type: String): Int = when (type) {
-        "機構代碼", "醫事機構代碼" -> 0
-        "身分證字號" -> 1
-        "健保碼" -> 2
-        else -> 3
+    private fun selectedText(view: TextView): String {
+        val start = view.selectionStart
+        val end = view.selectionEnd
+        return if (start >= 0 && end >= 0 && start != end) {
+            view.text.subSequence(minOf(start, end), maxOf(start, end)).toString()
+        } else ""
     }
 
-    private fun insertEntryGrouped(entry: Entry) {
-        val rank = typeRank(entry.type)
-        val insertAt = entries.indexOfLast { typeRank(it.type) <= rank }
-        if (insertAt < 0) {
-            entries.add(0, entry)
-        } else {
-            entries.add(insertAt + 1, entry)
-        }
-    }
-
-    private fun renderEntries() {
-        listContainer.removeAllViews()
-        if (entries.isEmpty()) {
-            listContainer.addView(TextView(this).apply {
-                text = "尚無候選值。辨識後會整理可能的代碼；完整 OCR 文字可另外查看。"
-                setTextColor(Color.GRAY)
-                setPadding(0, dp(8), 0, dp(8))
-            })
-            return
-        }
-        entries.forEachIndexed { index, entry ->
-            val card = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(12), dp(10), dp(12), dp(10))
-                setBackgroundColor(Color.WHITE)
-            }
-            card.addView(TextView(this).apply {
-                text = "${index + 1}. ${entry.type}" + if (entry.confirmed) " · 已確認/手動輸入" else " · 待核對"
-                textSize = 14f
-                setTextColor(if (entry.confirmed) Color.rgb(30, 120, 70) else Color.rgb(170, 90, 20))
-                typeface = Typeface.DEFAULT_BOLD
-            })
-            card.addView(TextView(this).apply {
-                text = entry.value
-                textSize = 21f
-                setTextColor(Color.rgb(20, 45, 70))
-                setPadding(0, dp(4), 0, dp(8))
-            })
-            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            row.addView(smallButton("編輯") { editEntry(index) },
-                LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginEnd = dp(3) })
-            row.addView(smallButton("↑") { moveEntry(index, -1) },
-                LinearLayout.LayoutParams(0, dp(40), 0.5f).apply { marginStart = dp(3); marginEnd = dp(3) })
-            row.addView(smallButton("↓") { moveEntry(index, 1) },
-                LinearLayout.LayoutParams(0, dp(40), 0.5f).apply { marginStart = dp(3); marginEnd = dp(3) })
-            row.addView(smallButton("刪除") {
-                entries.removeAt(index)
-                if (currentBarcodeIndex >= entries.size) currentBarcodeIndex = (entries.size - 1).coerceAtLeast(0)
-                renderEntries()
-                if (entries.isEmpty()) barcodePanel.visibility = View.GONE
-            }, LinearLayout.LayoutParams(0, dp(40), 1f).apply { marginStart = dp(3) })
-            card.addView(row)
-            listContainer.addView(card, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
-        }
-    }
-
-    private fun editEntry(index: Int) {
-        if (index !in entries.indices) return
-        val entry = entries[index]
-        val input = EditText(this).apply { setText(entry.value); setSelection(text.length); setSingleLine(true) }
-        val types = listOf("機構代碼", "身分證字號", "健保碼", "其他文字")
-        val spinner = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, types)
-            setSelection(types.indexOf(entry.type).takeIf { it >= 0 } ?: 0)
-        }
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(4), dp(20), 0)
-            addView(spinner)
-            addView(input)
-        }
-        android.app.AlertDialog.Builder(this)
-            .setTitle("編輯第 ${index + 1} 筆")
-            .setView(box)
-            .setNegativeButton("取消", null)
-            .setPositiveButton("儲存") { _, _ ->
-                val value = input.text.toString().trim()
-                if (value.isNotEmpty() && index in entries.indices) {
-                    entries[index].value = value
-                    entries[index].type = spinner.selectedItem.toString()
-                    entries[index].confirmed = true
-                    renderEntries()
-                }
-            }.show()
-    }
-
-    private fun moveEntry(index: Int, offset: Int) {
-        val newIndex = index + offset
-        if (index !in entries.indices || newIndex !in entries.indices) return
-        val item = entries.removeAt(index)
-        entries.add(newIndex, item)
-        renderEntries()
-    }
-
-    private fun renderBarcode() {
-        if (entries.isEmpty()) {
-            barcodePanel.visibility = View.GONE
-            return
-        }
-        val entry = entries[currentBarcodeIndex.coerceIn(entries.indices)]
-        try {
-            val bitMatrix = MultiFormatWriter().encode(entry.value, BarcodeFormat.CODE_128, 1000, 260,
-                mapOf(EncodeHintType.MARGIN to 12))
-            val bitmap = Bitmap.createBitmap(bitMatrix.width, bitMatrix.height, Bitmap.Config.ARGB_8888)
-            for (x in 0 until bitMatrix.width) for (y in 0 until bitMatrix.height) {
-                bitmap.setPixel(x, y, if (bitMatrix[x, y]) Color.BLACK else Color.WHITE)
-            }
-            barcodeImage.setImageBitmap(bitmap)
-            counter.text = "${currentBarcodeIndex + 1} / ${entries.size}　${entry.type}"
-            barcodeValue.text = entry.value
-            barcodePanel.visibility = View.VISIBLE
-            status.text = "請掃描目前這一筆；確認電腦欄位已選好。"
-        } catch (e: Exception) {
-            status.text = "無法產生條碼：${e.localizedMessage ?: "請檢查文字"}"
+    override fun onResume() {
+        super.onResume()
+        if (hidDevice != null && !hidRegistered && !hidRegistrationRequested &&
+            (Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED)
+        ) {
+            registerHidKeyboard()
         }
     }
 
@@ -586,7 +399,225 @@ class MainActivity : AppCompatActivity() {
                 try { engine.release() } catch (_: Throwable) { /* best effort */ }
             }
         }
+        try {
+            hidDevice?.unregisterApp()
+            bluetoothAdapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, hidDevice)
+        } catch (_: SecurityException) {
+            // Bluetooth permission can be revoked while the activity is open.
+        }
         super.onDestroy()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun prepareKeyboard(pairing: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            status.text = "藍牙鍵盤模式需要 Android 9 或更新版本。"
+            return
+        }
+        pendingPairing = pairing
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val needed = mutableListOf(Manifest.permission.BLUETOOTH_CONNECT)
+            if (pairing) needed.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            val missing = needed.filter {
+                ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+            }
+            if (missing.isNotEmpty()) {
+                bluetoothPermissionRequest.launch(missing.toTypedArray())
+                return
+            }
+        }
+        startHidRegistration(pairing)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startHidRegistration(pairing: Boolean) {
+        pendingPairing = pairing
+        val manager = getSystemService(BluetoothManager::class.java)
+        bluetoothAdapter = manager?.adapter
+        val adapter = bluetoothAdapter
+        if (adapter == null) {
+            status.text = "這台手機沒有藍牙功能。"
+            return
+        }
+        if (!adapter.isEnabled) {
+            enableBluetoothRequest.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            return
+        }
+        if (hidDevice != null) {
+            if (hidRegistered) {
+                if (pairing) makePhoneDiscoverable() else showPairedHosts()
+            }
+            return
+        }
+        status.text = "正在準備藍牙鍵盤……"
+        if (!adapter.getProfileProxy(this, hidProfileListener, BluetoothProfile.HID_DEVICE)) {
+            status.text = "手機系統不支援藍牙 HID 鍵盤。"
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun registerHidKeyboard() {
+        val descriptor = byteArrayOf(
+            0x05, 0x01, 0x09, 0x06, 0xA1.toByte(), 0x01,
+            0x05, 0x07, 0x19, 0xE0.toByte(), 0x29, 0xE7.toByte(),
+            0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95.toByte(), 0x08,
+            0x81.toByte(), 0x02, 0x95.toByte(), 0x01, 0x75, 0x08,
+            0x81.toByte(), 0x01, 0x95.toByte(), 0x05, 0x75, 0x01,
+            0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91.toByte(), 0x02,
+            0x95.toByte(), 0x01, 0x75, 0x03, 0x91.toByte(), 0x01,
+            0x95.toByte(), 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
+            0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81.toByte(), 0x00, 0xC0.toByte()
+        )
+        val settings = BluetoothHidDeviceAppSdpSettings(
+            "PhotoBarcode Keyboard",
+            "OCR text input keyboard",
+            "Photobarcode",
+            BluetoothHidDevice.SUBCLASS1_KEYBOARD,
+            descriptor
+        )
+        hidRegistrationRequested = true
+        val registered = hidDevice?.registerApp(settings, null, null, mainExecutor, hidCallback) == true
+        if (!registered) {
+            hidRegistrationRequested = false
+            status.text = "無法註冊藍牙鍵盤，請確認手機支援 HID Device。"
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun makePhoneDiscoverable() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED
+        ) {
+            status.text = "需要「附近裝置」權限，才能讓電腦找到手機鍵盤。"
+            return
+        }
+        status.text = "正在開啟手機配對模式……"
+        discoverableRequest.launch(
+            Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
+                putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
+            }
+        )
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun refreshConnectedHost() {
+        connectedHost = try {
+            hidDevice?.connectedDevices?.firstOrNull()
+        } catch (_: SecurityException) {
+            null
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun showPairedHosts() {
+        val adapter = bluetoothAdapter
+        if (adapter == null) {
+            status.text = "請先啟用藍牙。"
+            return
+        }
+        val hosts = try {
+            adapter.bondedDevices.toList()
+        } catch (_: SecurityException) {
+            emptyList()
+        }
+        if (hosts.isEmpty()) {
+            status.text = "尚未配對電腦。請按「配對電腦」，再從電腦的藍牙設定新增手機。"
+            return
+        }
+        val labels = hosts.map { it.name ?: it.address }.toTypedArray()
+        android.app.AlertDialog.Builder(this)
+            .setTitle("選擇已配對的電腦")
+            .setItems(labels) { _, which ->
+                val target = hosts[which]
+                status.text = "正在連線到 " + (target.name ?: "電腦") + "……"
+                val started = try {
+                    hidDevice?.connect(target) == true
+                } catch (_: SecurityException) {
+                    false
+                }
+                if (!started) status.text = "連線要求未送出。請確認電腦已完成配對後再試。"
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun keyStrokeFor(char: Char): KeyStroke? {
+        if (char in 'a'..'z') return KeyStroke(0, 0x04 + (char - 'a'))
+        if (char in 'A'..'Z') return KeyStroke(0x02, 0x04 + (char - 'A'))
+        if (char in '1'..'9') return KeyStroke(0, 0x1E + (char - '1'))
+        if (char == '0') return KeyStroke(0, 0x27)
+        return when (char) {
+            ' ' -> KeyStroke(0, 0x2C)
+            '-' -> KeyStroke(0, 0x2D)
+            '_' -> KeyStroke(0x02, 0x2D)
+            '=' -> KeyStroke(0, 0x2E)
+            '+' -> KeyStroke(0x02, 0x2E)
+            '[' -> KeyStroke(0, 0x2F)
+            '{' -> KeyStroke(0x02, 0x2F)
+            ']' -> KeyStroke(0, 0x30)
+            '}' -> KeyStroke(0x02, 0x30)
+            '\\' -> KeyStroke(0, 0x31)
+            '|' -> KeyStroke(0x02, 0x31)
+            ';' -> KeyStroke(0, 0x33)
+            ':' -> KeyStroke(0x02, 0x33)
+            '\'' -> KeyStroke(0, 0x34)
+            '"' -> KeyStroke(0x02, 0x34)
+            '`' -> KeyStroke(0, 0x35)
+            '~' -> KeyStroke(0x02, 0x35)
+            ',' -> KeyStroke(0, 0x36)
+            '<' -> KeyStroke(0x02, 0x36)
+            '.' -> KeyStroke(0, 0x37)
+            '>' -> KeyStroke(0x02, 0x37)
+            '/' -> KeyStroke(0, 0x38)
+            '?' -> KeyStroke(0x02, 0x38)
+            '!' -> KeyStroke(0x02, 0x1E)
+            '@' -> KeyStroke(0x02, 0x1F)
+            '#' -> KeyStroke(0x02, 0x20)
+            '$' -> KeyStroke(0x02, 0x21)
+            '%' -> KeyStroke(0x02, 0x22)
+            '^' -> KeyStroke(0x02, 0x23)
+            '&' -> KeyStroke(0x02, 0x24)
+            '*' -> KeyStroke(0x02, 0x25)
+            '(' -> KeyStroke(0x02, 0x26)
+            ')' -> KeyStroke(0x02, 0x27)
+            else -> null
+        }
+    }
+
+    private fun sendTextToComputer(text: String) {
+        val value = text.trim()
+        if (value.isEmpty()) {
+            status.text = "請先選取或輸入要發送的文字。"
+            return
+        }
+        val strokes = value.map { keyStrokeFor(it) }
+        if (strokes.any { it == null }) {
+            status.text = "文字含有藍牙鍵盤不支援的字元；目前支援英文字母、數字、空格及常見符號。"
+            return
+        }
+        val host = connectedHost
+        val keyboard = hidDevice
+        if (!hidRegistered || keyboard == null || host == null) {
+            status.text = "尚未連線電腦。請先配對並按「連線電腦」。"
+            return
+        }
+        lifecycleScope.launch {
+            status.text = "正在輸入到 " + (host.name ?: "電腦") + "……"
+            try {
+                strokes.filterNotNull().forEach { stroke ->
+                    val pressed = byteArrayOf(
+                        stroke.modifiers.toByte(), 0, stroke.keyCode.toByte(), 0, 0, 0, 0, 0
+                    )
+                    check(keyboard.sendReport(host, 0, pressed)) { "藍牙鍵盤傳送失敗" }
+                    delay(12)
+                    check(keyboard.sendReport(host, 0, ByteArray(8))) { "藍牙鍵盤釋放按鍵失敗" }
+                    delay(12)
+                }
+                status.text = "已傳送 " + value.length + " 個字元。"
+            } catch (e: Exception) {
+                status.text = "傳送失敗：" + (e.localizedMessage ?: "請確認電腦仍保持連線。")
+            }
+        }
     }
 
     private fun button(label: String, action: () -> Unit) = Button(this).apply {
