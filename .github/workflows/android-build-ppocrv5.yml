@@ -2,9 +2,9 @@ name: Android Build - PaddleOCR PP-OCRv5
 
 on:
   push:
-    branches: ["main", "master", "paddleocr-ppocrv5-integration"]
+    branches: ["virtual-keyboard", "master", "paddleocr-ppocrv5-integration"]
   pull_request:
-    branches: ["main", "master"]
+    branches: ["virtual-keyboard", "master"]
   workflow_dispatch:
 
 permissions:
