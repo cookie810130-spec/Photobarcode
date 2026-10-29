@@ -2,9 +2,9 @@ name: Android Build
 
 on:
   push:
-    branches: ["main", "master"]
+    branches: ["virtual-keyboard", "master"]
   pull_request:
-    branches: ["main", "master"]
+    branches: ["virtual-keyboard", "master"]
   workflow_dispatch:
 
 permissions:
