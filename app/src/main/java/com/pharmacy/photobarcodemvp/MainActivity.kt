@@ -224,6 +224,20 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams(0, dp(60), 1f).apply { marginStart = dp(4) })
         content.addView(keyRow)
 
+        val arrowRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER
+        }
+        arrowRow.addView(button("←") { sendControlKey(0x50, "左") },
+            LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginEnd = dp(4) })
+        arrowRow.addView(button("↑") { sendControlKey(0x52, "上") },
+            LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
+        arrowRow.addView(button("↓") { sendControlKey(0x51, "下") },
+            LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
+        arrowRow.addView(button("→") { sendControlKey(0x4F, "右") },
+            LinearLayout.LayoutParams(0, dp(52), 1f).apply { marginStart = dp(4) })
+        content.addView(arrowRow)
+
         content.addView(button("傳送到電腦") {
             val manual = manualInput.text.toString()
             val selected = selectedText(ocrTextView)
